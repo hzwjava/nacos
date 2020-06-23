@@ -15,9 +15,9 @@
  */
 package com.alibaba.nacos.config.server.service.notify;
 
+import com.alibaba.nacos.common.utils.IoUtils;
 import com.alibaba.nacos.config.server.manager.TaskManager;
-import com.alibaba.nacos.config.server.service.ServerListService;
-import org.apache.commons.io.IOUtils;
+import com.alibaba.nacos.core.cluster.ServerMemberManager;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 
@@ -28,25 +28,24 @@ import java.net.URL;
 import java.util.Iterator;
 import java.util.List;
 
-
 /**
  * 通知其他节点取最新数据的服务。 监听数据变更事件，通知所有的server。
+ *
  * @author jiuRen
  */
-public class NotifyService
-{
+public class NotifyService {
 
     @Autowired
-    public NotifyService(ServerListService serverListService) {
+    public NotifyService(ServerMemberManager memberManager) {
         notifyTaskManager = new TaskManager("com.alibaba.nacos.NotifyTaskManager");
-        notifyTaskManager.setDefaultTaskProcessor(new NotifyTaskProcessor(serverListService));
+        notifyTaskManager.setDefaultTaskProcessor(new NotifyTaskProcessor(memberManager));
     }
 
     protected NotifyService() {
     }
 
     /**
-     *  為了方便系统beta，不改变notify.do接口，新增lastModifed参数通过Http header传递
+     * 為了方便系统beta，不改变notify.do接口，新增lastModifed参数通过Http header传递
      */
     static public final String NOTIFY_HEADER_LAST_MODIFIED = "lastModified";
     static public final String NOTIFY_HEADER_OP_HANDLE_IP = "opHandleIp";
@@ -54,14 +53,14 @@ public class NotifyService
     static public HttpResult invokeURL(String url, List<String> headers, String encoding) throws IOException {
         HttpURLConnection conn = null;
         try {
-            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn = (HttpURLConnection)new URL(url).openConnection();
 
             conn.setConnectTimeout(TIMEOUT);
             conn.setReadTimeout(TIMEOUT);
             conn.setRequestMethod("GET");
 
             if (null != headers && !StringUtils.isEmpty(encoding)) {
-                for (Iterator<String> iter = headers.iterator(); iter.hasNext();) {
+                for (Iterator<String> iter = headers.iterator(); iter.hasNext(); ) {
                     conn.addRequestProperty(iter.next(), iter.next());
                 }
             }
@@ -69,36 +68,34 @@ public class NotifyService
             /**
              *  建立TCP连接
              */
-            conn.connect(); 
+            conn.connect();
             /**
              * 这里内部发送请求
              */
-            int respCode = conn.getResponseCode(); 
+            int respCode = conn.getResponseCode();
             String resp = null;
-            
+
             if (HttpServletResponse.SC_OK == respCode) {
-                resp = IOUtils.toString(conn.getInputStream());
+                resp = IoUtils.toString(conn.getInputStream(),encoding);
             } else {
-                resp = IOUtils.toString(conn.getErrorStream());
+                resp = IoUtils.toString(conn.getErrorStream(),encoding);
             }
             return new HttpResult(respCode, resp);
         } finally {
-            if (conn != null) {
-                conn.disconnect();
-            }
+            IoUtils.closeQuietly(conn);
         }
     }
-    
+
     static public class HttpResult {
         final public int code;
         final public String content;
-        
+
         public HttpResult(int code, String content) {
             this.code = code;
             this.content = content;
         }
     }
-    
+
     /**
      * 和其他server的连接超时和socket超时
      */

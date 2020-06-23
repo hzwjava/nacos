@@ -17,13 +17,18 @@ package com.alibaba.nacos.naming;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * Hello world!
  *
  * @author xxc
  */
-@SpringBootApplication
+@EnableScheduling
+@SpringBootApplication(scanBasePackages = {
+        "com.alibaba.nacos.naming",
+        "com.alibaba.nacos.core"
+})
 public class NamingApp {
 
     public static void main(String[] args) {

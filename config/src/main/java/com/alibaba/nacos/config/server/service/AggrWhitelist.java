@@ -15,8 +15,9 @@
  */
 package com.alibaba.nacos.config.server.service;
 
+import com.alibaba.nacos.common.utils.IoUtils;
 import com.alibaba.nacos.config.server.utils.RegexParser;
-import org.apache.commons.io.IOUtils;
+
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
 
@@ -29,20 +30,22 @@ import java.util.regex.Pattern;
 import static com.alibaba.nacos.config.server.utils.LogUtil.defaultLog;
 import static com.alibaba.nacos.config.server.utils.LogUtil.fatalLog;
 
-
 /**
  * 聚合数据白名单。
+ *
  * @author Nacos
  */
 @Service
 public class AggrWhitelist {
 
+    public static final String AGGRIDS_METADATA = "com.alibaba.nacos.metadata.aggrIDs";
+
     /**
      * 判断指定的dataId是否在聚合dataId白名单。
      */
-    static public boolean isAggrDataId(String dataId) {
+     public static boolean isAggrDataId(String dataId) {
         if (null == dataId) {
-            throw new IllegalArgumentException();
+            throw new IllegalArgumentException("dataId is null");
         }
 
         for (Pattern pattern : AGGR_DATAID_WHITELIST.get()) {
@@ -56,15 +59,15 @@ public class AggrWhitelist {
     /**
      * 传入内容，重新加载聚合白名单
      */
-    static public void load(String content) {
+     public static void load(String content) {
         if (StringUtils.isBlank(content)) {
             fatalLog.error("aggr dataId whitelist is blank.");
             return;
         }
         defaultLog.warn("[aggr-dataIds] {}", content);
-        
+
         try {
-            List<String> lines = IOUtils.readLines(new StringReader(content));
+            List<String> lines = IoUtils.readLines(new StringReader(content));
             compile(lines);
         } catch (Exception ioe) {
             defaultLog.error("failed to load aggr whitelist, " + ioe.toString(), ioe);
@@ -83,14 +86,12 @@ public class AggrWhitelist {
         AGGR_DATAID_WHITELIST.set(list);
     }
 
-    static public List<Pattern> getWhiteList() {
+    public static List<Pattern> getWhiteList() {
         return AGGR_DATAID_WHITELIST.get();
     }
-    
+
     // =======================
 
-    static public final String AGGRIDS_METADATA = "com.alibaba.nacos.metadata.aggrIDs";
-
     static final AtomicReference<List<Pattern>> AGGR_DATAID_WHITELIST = new AtomicReference<List<Pattern>>(
-            new ArrayList<Pattern>());
+        new ArrayList<Pattern>());
 }

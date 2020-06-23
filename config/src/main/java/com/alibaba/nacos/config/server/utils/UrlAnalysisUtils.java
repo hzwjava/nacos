@@ -20,17 +20,14 @@ import com.alibaba.nacos.config.server.constant.Constants;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-
 /**
  * 分析url的工具类
- * 
+ *
  * @author leiwen.zh
- * 
  */
 public class UrlAnalysisUtils {
 
-    private static Pattern urlPattern = Pattern.compile("^(\\w+://)?([\\w\\.]+:)(\\d*)?(\\??.*)");
-
+    private static final Pattern URL_PATTERN = Pattern.compile("^(\\w+://)?([\\w\\.]+:)(\\d*)?(\\??.*)");
 
     public static String getContentIdentity(String content) {
 
@@ -38,7 +35,7 @@ public class UrlAnalysisUtils {
             return null;
         }
 
-        Matcher matcher = urlPattern.matcher(content);
+        Matcher matcher = URL_PATTERN.matcher(content);
         StringBuilder buf = new StringBuilder();
         if (matcher.find()) {
             String scheme = matcher.group(1);
@@ -54,7 +51,6 @@ public class UrlAnalysisUtils {
         }
         return buf.toString();
     }
-
 
     private static boolean verifyIncrementPubContent(String content) {
 

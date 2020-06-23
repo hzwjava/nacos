@@ -15,13 +15,16 @@
  */
 package com.alibaba.nacos.api.naming.pojo;
 
-import com.alibaba.nacos.api.common.Constants;
-
 import java.util.HashMap;
 import java.util.Map;
 
+import com.alibaba.nacos.api.naming.pojo.healthcheck.AbstractHealthChecker;
+import com.alibaba.nacos.api.naming.pojo.healthcheck.impl.Tcp;
+
 /**
- * @author dungu.zpf
+ * Cluster
+ *
+ * @author nkorange
  */
 public class Cluster {
 
@@ -38,7 +41,7 @@ public class Cluster {
     /**
      * Health check config of this cluster
      */
-    private AbstractHealthChecker healthChecker = new AbstractHealthChecker.Tcp();
+    private AbstractHealthChecker healthChecker = new Tcp();
 
     /**
      * Default registered port for instances in this cluster.
@@ -54,7 +57,6 @@ public class Cluster {
      * Whether or not use instance port to do health check.
      */
     private boolean useIPPort4Check = true;
-
 
     private Map<String, String> metadata = new HashMap<String, String>();
 

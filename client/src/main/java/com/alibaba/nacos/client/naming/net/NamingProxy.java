@@ -15,32 +15,58 @@
  */
 package com.alibaba.nacos.client.naming.net;
 
-import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.JSONObject;
-import com.alibaba.fastjson.TypeReference;
+import com.alibaba.nacos.api.PropertyKeyConst;
+import com.alibaba.nacos.api.SystemPropertyKeyConst;
+import com.alibaba.nacos.api.common.Constants;
 import com.alibaba.nacos.api.exception.NacosException;
+import com.alibaba.nacos.api.naming.CommonParams;
 import com.alibaba.nacos.api.naming.pojo.Instance;
 import com.alibaba.nacos.api.naming.pojo.ListView;
-import com.alibaba.nacos.client.naming.utils.*;
-import com.alibaba.nacos.common.util.UuidUtil;
+import com.alibaba.nacos.api.naming.pojo.Service;
+import com.alibaba.nacos.api.selector.AbstractSelector;
+import com.alibaba.nacos.api.selector.ExpressionSelector;
+import com.alibaba.nacos.api.selector.SelectorType;
+import com.alibaba.nacos.client.config.impl.SpasAdapter;
+import com.alibaba.nacos.client.monitor.MetricsMonitor;
+import com.alibaba.nacos.client.naming.beat.BeatInfo;
+import com.alibaba.nacos.client.naming.utils.CollectionUtils;
+import com.alibaba.nacos.client.naming.utils.NetUtils;
+import com.alibaba.nacos.client.naming.utils.SignUtil;
+import com.alibaba.nacos.client.naming.utils.UtilAndComs;
+import com.alibaba.nacos.client.security.SecurityProxy;
+import com.alibaba.nacos.client.utils.AppNameUtils;
+import com.alibaba.nacos.client.utils.TemplateUtils;
+import com.alibaba.nacos.common.constant.HttpHeaderConsts;
+import com.alibaba.nacos.common.utils.HttpMethod;
+import com.alibaba.nacos.common.utils.IoUtils;
+import com.alibaba.nacos.common.utils.JacksonUtils;
+import com.alibaba.nacos.common.utils.UuidUtils;
+import com.alibaba.nacos.common.utils.VersionUtils;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+
+import org.apache.commons.lang3.StringUtils;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
+import java.net.URLEncoder;
 import java.util.*;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+
+import static com.alibaba.nacos.client.utils.LogUtils.NAMING_LOGGER;
 
 /**
- * @author dungu.zpf
+ * @author nkorange
  */
 public class NamingProxy {
 
     private static final int DEFAULT_SERVER_PORT = 8848;
 
-    private String namespace;
+    private int serverPort = DEFAULT_SERVER_PORT;
+
+    private String namespaceId;
 
     private String endpoint;
 
@@ -50,15 +76,22 @@ public class NamingProxy {
 
     private List<String> serversFromEndpoint = new ArrayList<String>();
 
+    private SecurityProxy securityProxy;
+
     private long lastSrvRefTime = 0L;
 
     private long vipSrvRefInterMillis = TimeUnit.SECONDS.toMillis(30);
 
-    private ScheduledExecutorService executorService;
+    private long securityInfoRefreshIntervalMills = TimeUnit.SECONDS.toMillis(5);
 
-    public NamingProxy(String namespace, String endpoint, String serverList) {
+    private Properties properties;
 
-        this.namespace = namespace;
+    public NamingProxy(String namespaceId, String endpoint, String serverList, Properties properties) {
+
+        securityProxy = new SecurityProxy(properties);
+        this.properties = properties;
+        this.setServerPort(DEFAULT_SERVER_PORT);
+        this.namespaceId = namespaceId;
         this.endpoint = endpoint;
         if (StringUtils.isNotEmpty(serverList)) {
             this.serverList = Arrays.asList(serverList.split(","));
@@ -67,11 +100,16 @@ public class NamingProxy {
             }
         }
 
-        executorService = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
+        initRefreshTask();
+    }
+
+    private void initRefreshTask() {
+
+        ScheduledExecutorService executorService = new ScheduledThreadPoolExecutor(2, new ThreadFactory() {
             @Override
             public Thread newThread(Runnable r) {
                 Thread t = new Thread(r);
-                t.setName("com.taobao.vipserver.serverlist.updater");
+                t.setName("com.alibaba.nacos.client.naming.updater");
                 t.setDaemon(true);
                 return t;
             }
@@ -84,23 +122,28 @@ public class NamingProxy {
             }
         }, 0, vipSrvRefInterMillis, TimeUnit.MILLISECONDS);
 
+
+        executorService.scheduleWithFixedDelay(new Runnable() {
+            @Override
+            public void run() {
+                securityProxy.login(getServerList());
+            }
+        }, 0, securityInfoRefreshIntervalMills, TimeUnit.MILLISECONDS);
+
         refreshSrvIfNeed();
+        securityProxy.login(getServerList());
     }
 
     public List<String> getServerListFromEndpoint() {
 
         try {
-            String urlString = "http://" + endpoint + "/vipserver/serverlist";
-
-            List<String> headers = Arrays.asList("Client-Version", UtilAndComs.VERSION,
-                    "Accept-Encoding", "gzip,deflate,sdch",
-                    "Connection", "Keep-Alive",
-                    "RequestId", UuidUtil.generateUuid());
+            String urlString = "http://" + endpoint + "/nacos/serverlist";
+            List<String> headers = builderHeaders();
 
             HttpClient.HttpResult result = HttpClient.httpGet(urlString, headers, null, UtilAndComs.ENCODING);
             if (HttpURLConnection.HTTP_OK != result.code) {
                 throw new IOException("Error while requesting: " + urlString + "'. Server returned: "
-                        + result.code);
+                    + result.code);
             }
 
             String content = result.content;
@@ -124,7 +167,7 @@ public class NamingProxy {
         try {
 
             if (!CollectionUtils.isEmpty(serverList)) {
-                LogUtils.LOG.debug("server list provided by user: " + serverList);
+                NAMING_LOGGER.debug("server list provided by user: " + serverList);
                 return;
             }
 
@@ -135,163 +178,262 @@ public class NamingProxy {
             List<String> list = getServerListFromEndpoint();
 
             if (CollectionUtils.isEmpty(list)) {
-                throw new Exception("Can not acquire vipserver list");
+                throw new Exception("Can not acquire Nacos list");
             }
 
             if (!CollectionUtils.isEqualCollection(list, serversFromEndpoint)) {
-                LogUtils.LOG.info("SERVER-LIST", "server list is updated: " + list);
+                NAMING_LOGGER.info("[SERVER-LIST] server list is updated: " + list);
             }
 
             serversFromEndpoint = list;
             lastSrvRefTime = System.currentTimeMillis();
         } catch (Throwable e) {
-            LogUtils.LOG.warn("failed to update server list", e);
+            NAMING_LOGGER.warn("failed to update server list", e);
         }
     }
 
-    public void registerService(String serviceName, Instance instance) throws NacosException {
+    public void registerService(String serviceName, String groupName, Instance instance) throws NacosException {
 
-        LogUtils.LOG.info("REGISTER-SERVICE", "registering service " + serviceName + " with instance:" + instance);
+        NAMING_LOGGER.info("[REGISTER-SERVICE] {} registering service {} with instance: {}",
+            namespaceId, serviceName, instance);
 
-        final Map<String, String> params = new HashMap<String, String>(8);
-        params.put("tenant", namespace);
+        final Map<String, String> params = new HashMap<String, String>(9);
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, serviceName);
+        params.put(CommonParams.GROUP_NAME, groupName);
+        params.put(CommonParams.CLUSTER_NAME, instance.getClusterName());
         params.put("ip", instance.getIp());
         params.put("port", String.valueOf(instance.getPort()));
         params.put("weight", String.valueOf(instance.getWeight()));
         params.put("enable", String.valueOf(instance.isEnabled()));
         params.put("healthy", String.valueOf(instance.isHealthy()));
-        params.put("metadata", JSON.toJSONString(instance.getMetadata()));
-        if (instance.getService() == null) {
-            params.put("serviceName", serviceName);
-        } else {
-            params.put("service", JSON.toJSONString(instance.getService()));
-        }
-        params.put("cluster", JSON.toJSONString(instance.getCluster()));
+        params.put("ephemeral", String.valueOf(instance.isEphemeral()));
+        params.put("metadata", JacksonUtils.toJson(instance.getMetadata()));
 
-        reqAPI(UtilAndComs.NACOS_URL_INSTANCE, params, "PUT");
+        reqAPI(UtilAndComs.NACOS_URL_INSTANCE, params, HttpMethod.POST);
+
     }
 
-    public void deregisterService(String serviceName, String ip, int port, String cluster) throws NacosException {
+    public void deregisterService(String serviceName, Instance instance) throws NacosException {
 
-        LogUtils.LOG.info("DEREGISTER-SERVICE", "deregistering service " + serviceName
-                + " with instance:" + ip + ":" + port + "@" + cluster);
+        NAMING_LOGGER.info("[DEREGISTER-SERVICE] {} deregistering service {} with instance: {}",
+            namespaceId, serviceName, instance);
 
         final Map<String, String> params = new HashMap<String, String>(8);
-        params.put("tenant", namespace);
-        params.put("ip", ip);
-        params.put("port", String.valueOf(port));
-        params.put("serviceName", serviceName);
-        params.put("cluster", cluster);
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, serviceName);
+        params.put(CommonParams.CLUSTER_NAME, instance.getClusterName());
+        params.put("ip", instance.getIp());
+        params.put("port", String.valueOf(instance.getPort()));
+        params.put("ephemeral", String.valueOf(instance.isEphemeral()));
 
-        reqAPI(UtilAndComs.NACOS_URL_INSTANCE, params, "DELETE");
+        reqAPI(UtilAndComs.NACOS_URL_INSTANCE, params, HttpMethod.DELETE);
     }
 
-    public String queryList(String serviceName, String clusters, boolean healthyOnly) throws NacosException {
+    public void updateInstance(String serviceName, String groupName, Instance instance) throws NacosException {
+        NAMING_LOGGER.info("[UPDATE-SERVICE] {} update service {} with instance: {}",
+            namespaceId, serviceName, instance);
 
         final Map<String, String> params = new HashMap<String, String>(8);
-        params.put("tenant", namespace);
-        params.put("serviceName", serviceName);
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, serviceName);
+        params.put(CommonParams.GROUP_NAME, groupName);
+        params.put(CommonParams.CLUSTER_NAME, instance.getClusterName());
+        params.put("ip", instance.getIp());
+        params.put("port", String.valueOf(instance.getPort()));
+        params.put("weight", String.valueOf(instance.getWeight()));
+        params.put("enabled", String.valueOf(instance.isEnabled()));
+        params.put("ephemeral", String.valueOf(instance.isEphemeral()));
+        params.put("metadata", JacksonUtils.toJson(instance.getMetadata()));
+
+        reqAPI(UtilAndComs.NACOS_URL_INSTANCE, params, HttpMethod.PUT);
+    }
+
+    public Service queryService(String serviceName, String groupName) throws NacosException {
+        NAMING_LOGGER.info("[QUERY-SERVICE] {} query service : {}, {}",
+            namespaceId, serviceName, groupName);
+
+        final Map<String, String> params = new HashMap<String, String>(3);
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, serviceName);
+        params.put(CommonParams.GROUP_NAME, groupName);
+
+        String result = reqAPI(UtilAndComs.NACOS_URL_SERVICE, params, HttpMethod.GET);
+        return JacksonUtils.toObj(result, Service.class);
+    }
+
+    public void createService(Service service, AbstractSelector selector) throws NacosException {
+
+        NAMING_LOGGER.info("[CREATE-SERVICE] {} creating service : {}",
+            namespaceId, service);
+
+        final Map<String, String> params = new HashMap<String, String>(6);
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, service.getName());
+        params.put(CommonParams.GROUP_NAME, service.getGroupName());
+        params.put("protectThreshold", String.valueOf(service.getProtectThreshold()));
+        params.put("metadata", JacksonUtils.toJson(service.getMetadata()));
+        params.put("selector", JacksonUtils.toJson(selector));
+
+        reqAPI(UtilAndComs.NACOS_URL_SERVICE, params, HttpMethod.POST);
+
+    }
+
+    public boolean deleteService(String serviceName, String groupName) throws NacosException {
+        NAMING_LOGGER.info("[DELETE-SERVICE] {} deleting service : {} with groupName : {}",
+            namespaceId, serviceName, groupName);
+
+        final Map<String, String> params = new HashMap<String, String>(6);
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, serviceName);
+        params.put(CommonParams.GROUP_NAME, groupName);
+
+        String result = reqAPI(UtilAndComs.NACOS_URL_SERVICE, params, HttpMethod.DELETE);
+        return "ok".equals(result);
+    }
+
+    public void updateService(Service service, AbstractSelector selector) throws NacosException {
+        NAMING_LOGGER.info("[UPDATE-SERVICE] {} updating service : {}",
+            namespaceId, service);
+
+        final Map<String, String> params = new HashMap<String, String>(6);
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, service.getName());
+        params.put(CommonParams.GROUP_NAME, service.getGroupName());
+        params.put("protectThreshold", String.valueOf(service.getProtectThreshold()));
+        params.put("metadata", JacksonUtils.toJson(service.getMetadata()));
+        params.put("selector", JacksonUtils.toJson(selector));
+
+        reqAPI(UtilAndComs.NACOS_URL_SERVICE, params, HttpMethod.PUT);
+    }
+
+    public String queryList(String serviceName, String clusters, int udpPort, boolean healthyOnly)
+        throws NacosException {
+
+        final Map<String, String> params = new HashMap<String, String>(8);
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, serviceName);
         params.put("clusters", clusters);
+        params.put("udpPort", String.valueOf(udpPort));
+        params.put("clientIP", NetUtils.localIP());
         params.put("healthyOnly", String.valueOf(healthyOnly));
 
-        return reqAPI(UtilAndComs.NACOS_URL_BASE + "/instance/list", params, "GET");
+        return reqAPI(UtilAndComs.NACOS_URL_BASE + "/instance/list", params, HttpMethod.GET);
     }
 
-    private String doRegDom(Map<String, String> params) throws Exception {
-        String api = UtilAndComs.NACOS_URL_BASE + "/api/regService";
-        return reqAPI(api, params);
+    public JsonNode sendBeat(BeatInfo beatInfo, boolean lightBeatEnabled) throws NacosException {
+
+        if (NAMING_LOGGER.isDebugEnabled()) {
+            NAMING_LOGGER.debug("[BEAT] {} sending beat to server: {}", namespaceId, beatInfo.toString());
+        }
+        Map<String, String> params = new HashMap<String, String>(8);
+        String body = StringUtils.EMPTY;
+        if (!lightBeatEnabled) {
+            try {
+                body = "beat=" + URLEncoder.encode(JacksonUtils.toJson(beatInfo), "UTF-8");
+            } catch (UnsupportedEncodingException e) {
+                throw new NacosException(NacosException.SERVER_ERROR, "encode beatInfo error", e);
+            }
+        }
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.SERVICE_NAME, beatInfo.getServiceName());
+        params.put(CommonParams.CLUSTER_NAME, beatInfo.getCluster());
+        params.put("ip", beatInfo.getIp());
+        params.put("port", String.valueOf(beatInfo.getPort()));
+        String result = reqAPI(UtilAndComs.NACOS_URL_BASE + "/instance/beat", params, body, HttpMethod.PUT);
+        return JacksonUtils.toObj(result);
     }
 
     public boolean serverHealthy() {
 
         try {
-            reqAPI(UtilAndComs.NACOS_URL_BASE + "/api/hello", new HashMap<String, String>(2));
+            String result = reqAPI(UtilAndComs.NACOS_URL_BASE + "/operator/metrics",
+                new HashMap<String, String>(2), HttpMethod.GET);
+            JsonNode json = JacksonUtils.toObj(result);
+            String serverStatus = json.get("status").asText();
+            return "UP".equals(serverStatus);
         } catch (Exception e) {
             return false;
         }
-
-        return true;
     }
 
-    public ListView<String> getServiceList(int pageNo, int pageSize) throws NacosException {
+    public ListView<String> getServiceList(int pageNo, int pageSize, String groupName) throws NacosException {
+        return getServiceList(pageNo, pageSize, groupName, null);
+    }
+
+    public ListView<String> getServiceList(int pageNo, int pageSize, String groupName, AbstractSelector selector) throws NacosException {
 
         Map<String, String> params = new HashMap<String, String>(4);
         params.put("pageNo", String.valueOf(pageNo));
         params.put("pageSize", String.valueOf(pageSize));
+        params.put(CommonParams.NAMESPACE_ID, namespaceId);
+        params.put(CommonParams.GROUP_NAME, groupName);
 
-        String result = reqAPI(UtilAndComs.NACOS_URL_BASE + "/service/list", params);
+        if (selector != null) {
+            switch (SelectorType.valueOf(selector.getType())) {
+                case none:
+                    break;
+                case label:
+                    ExpressionSelector expressionSelector = (ExpressionSelector) selector;
+                    params.put("selector", JacksonUtils.toJson(expressionSelector));
+                    break;
+                default:
+                    break;
+            }
+        }
 
-        JSONObject json = JSON.parseObject(result);
-        ListView<String> listView = new ListView<String>();
-        listView.setCount(json.getInteger("count"));
-        listView.setData(JSON.parseObject(json.getString("doms"), new TypeReference<List<String>>() {
-        }));
+        String result = reqAPI(UtilAndComs.NACOS_URL_BASE + "/service/list", params, HttpMethod.GET);
+
+        JsonNode json = JacksonUtils.toObj(result);
+        ListView<String> listView = new ListView<>();
+        listView.setCount(json.get("count").asInt());
+        listView.setData(JacksonUtils.toObj(json.get("doms").toString(), new TypeReference<List<String>>() {}));
 
         return listView;
     }
 
-    public String callAllServers(String api, Map<String, String> params) throws NacosException {
-        String result = "";
-
-        List<String> snapshot = serversFromEndpoint;
-        if (!CollectionUtils.isEmpty(serverList)) {
-            snapshot = serverList;
-        }
-
-        try {
-            result = reqAPI(api, params, snapshot);
-        } catch (Exception e) {
-            LogUtils.LOG.error("NA", "req api:" + api + " failed, servers: " + snapshot, e);
-        }
-
-        if (StringUtils.isNotEmpty(result)) {
-            return result;
-        }
-
-        throw new IllegalStateException("failed to req API:/api/" + api + " after all sites(" + snapshot + ") tried");
-    }
-
-    public String reqAPI(String api, Map<String, String> params) throws NacosException {
-
-
-        List<String> snapshot = serversFromEndpoint;
-        if (!CollectionUtils.isEmpty(serverList)) {
-            snapshot = serverList;
-        }
-
-        return reqAPI(api, params, snapshot);
-    }
-
     public String reqAPI(String api, Map<String, String> params, String method) throws NacosException {
+        return reqAPI(api, params, StringUtils.EMPTY, method);
+    }
 
+    public String reqAPI(String api, Map<String, String> params, String body, String method) throws NacosException {
+        return reqAPI(api, params, body, getServerList(), method);
+    }
+
+    private List<String> getServerList() {
         List<String> snapshot = serversFromEndpoint;
         if (!CollectionUtils.isEmpty(serverList)) {
             snapshot = serverList;
         }
-
-        return reqAPI(api, params, snapshot, method);
+        return snapshot;
     }
 
-    public String callServer(String api, Map<String, String> params, String curServer) throws NacosException {
-        return callServer(api, params, curServer, "GET");
+    public String callServer(String api, Map<String, String> params, String body, String curServer) throws NacosException {
+        return callServer(api, params, body, curServer, HttpMethod.GET);
     }
 
-    public String callServer(String api, Map<String, String> params, String curServer, String method) throws NacosException {
-
-        List<String> headers = Arrays.asList("Client-Version", UtilAndComs.VERSION,
-                "Accept-Encoding", "gzip,deflate,sdch",
-                "Connection", "Keep-Alive",
-                "RequestId", UuidUtil.generateUuid());
+    public String callServer(String api, Map<String, String> params, String body, String curServer, String method)
+        throws NacosException {
+        long start = System.currentTimeMillis();
+        long end = 0;
+        injectSecurityInfo(params);
+        List<String> headers = builderHeaders();
 
         String url;
-
-        if (!curServer.contains(UtilAndComs.SERVER_ADDR_IP_SPLITER)) {
-            curServer = curServer + UtilAndComs.SERVER_ADDR_IP_SPLITER + DEFAULT_SERVER_PORT;
+        if (curServer.startsWith(UtilAndComs.HTTPS) || curServer.startsWith(UtilAndComs.HTTP)) {
+            url = curServer + api;
+        } else {
+            if (!curServer.contains(UtilAndComs.SERVER_ADDR_IP_SPLITER)) {
+                curServer = curServer + UtilAndComs.SERVER_ADDR_IP_SPLITER + serverPort;
+            }
+            url = HttpClient.getPrefix() + curServer + api;
         }
 
-        url = HttpClient.getPrefix() + curServer + api;
+        HttpClient.HttpResult result = HttpClient.request(url, headers, params, body, UtilAndComs.ENCODING, method);
+        end = System.currentTimeMillis();
 
-        HttpClient.HttpResult result = HttpClient.request(url, headers, params, UtilAndComs.ENCODING, method);
+        MetricsMonitor.getNamingRequestMonitor(method, url, String.valueOf(result.code))
+            .observe(end - start);
 
         if (HttpURLConnection.HTTP_OK == result.code) {
             return result.content;
@@ -301,24 +443,18 @@ public class NamingProxy {
             return StringUtils.EMPTY;
         }
 
-        LogUtils.LOG.error("CALL-SERVER", "failed to req API:" + HttpClient.getPrefix() + curServer
-                + api + ". code:"
-                + result.code + " msg: " + result.content);
-
-        throw new NacosException(NacosException.SERVER_ERROR, "failed to req API:" + HttpClient.getPrefix() + curServer
-                + api + ". code:"
-                + result.code + " msg: " + result.content);
+        throw new NacosException(result.code, result.content);
     }
 
-    public String reqAPI(String api, Map<String, String> params, List<String> servers) {
-        return reqAPI(api, params, servers, "GET");
-    }
+    public String reqAPI(String api, Map<String, String> params, String body, List<String> servers, String method) throws NacosException {
 
-    public String reqAPI(String api, Map<String, String> params, List<String> servers, String method) {
+        params.put(CommonParams.NAMESPACE_ID, getNamespaceId());
 
         if (CollectionUtils.isEmpty(servers) && StringUtils.isEmpty(nacosDomain)) {
-            throw new IllegalArgumentException("no server available");
+            throw new NacosException(NacosException.INVALID_PARAM, "no server available");
         }
+
+        NacosException exception = new NacosException();
 
         if (servers != null && !servers.isEmpty()) {
 
@@ -328,28 +464,124 @@ public class NamingProxy {
             for (int i = 0; i < servers.size(); i++) {
                 String server = servers.get(index);
                 try {
-                    return callServer(api, params, server, method);
-                } catch (Exception e) {
-                    LogUtils.LOG.error("NA", "req api:" + api + " failed, server(" + server, e);
+                    return callServer(api, params, body, server, method);
+                } catch (NacosException e) {
+                    exception = e;
+                    if (NAMING_LOGGER.isDebugEnabled()) {
+                        NAMING_LOGGER.debug("request {} failed.", server, e);
+                    }
                 }
-
                 index = (index + 1) % servers.size();
             }
-
-            throw new IllegalStateException("failed to req API:" + api + " after all servers(" + servers + ") tried");
         }
 
-
-        for (int i = 0; i < UtilAndComs.REQUEST_DOMAIN_RETRY_COUNT; i++) {
-            try {
-                return callServer(api, params, nacosDomain);
-            } catch (Exception e) {
-                LogUtils.LOG.error("NA", "req api:" + api + " failed, server(" + nacosDomain, e);
+        if (StringUtils.isNotBlank(nacosDomain)) {
+            for (int i = 0; i < UtilAndComs.REQUEST_DOMAIN_RETRY_COUNT; i++) {
+                try {
+                    return callServer(api, params, body, nacosDomain, method);
+                } catch (NacosException e) {
+                    exception = e;
+                    if (NAMING_LOGGER.isDebugEnabled()) {
+                        NAMING_LOGGER.debug("request {} failed.", nacosDomain, e);
+                    }
+                }
             }
         }
 
-        throw new IllegalStateException("failed to req API:/api/" + api + " after all servers(" + servers + ") tried");
+        NAMING_LOGGER.error("request: {} failed, servers: {}, code: {}, msg: {}",
+            api, servers, exception.getErrCode(), exception.getErrMsg());
+
+        throw new NacosException(exception.getErrCode(), "failed to req API:" + api + " after all servers(" + servers + ") tried: "
+            + exception.getMessage());
 
     }
 
+    private void injectSecurityInfo(Map<String, String> params) {
+
+        // Inject token if exist:
+        if (StringUtils.isNotBlank(securityProxy.getAccessToken())) {
+            params.put(Constants.ACCESS_TOKEN, securityProxy.getAccessToken());
+        }
+
+        // Inject ak/sk if exist:
+        String ak = getAccessKey();
+        String sk = getSecretKey();
+        params.put("app", AppNameUtils.getAppName());
+        if (StringUtils.isNotBlank(ak) && StringUtils.isNotBlank(sk)) {
+            try {
+                String signData = getSignData(params.get("serviceName"));
+                String signature = SignUtil.sign(signData, sk);
+                params.put("signature", signature);
+                params.put("data", signData);
+                params.put("ak", ak);
+            } catch (Exception e) {
+                NAMING_LOGGER.error("inject ak/sk failed.", e);
+            }
+        }
+    }
+
+    public List<String> builderHeaders() {
+        List<String> headers = Arrays.asList(
+            HttpHeaderConsts.CLIENT_VERSION_HEADER, VersionUtils.VERSION,
+            HttpHeaderConsts.USER_AGENT_HEADER, UtilAndComs.VERSION,
+            "Accept-Encoding", "gzip,deflate,sdch",
+            "Connection", "Keep-Alive",
+            "RequestId", UuidUtils.generateUuid(), "Request-Module", "Naming");
+        return headers;
+    }
+
+    private static String getSignData(String serviceName) {
+        return StringUtils.isNotEmpty(serviceName)
+            ? System.currentTimeMillis() + "@@" + serviceName
+            : String.valueOf(System.currentTimeMillis());
+    }
+
+    public String getAccessKey() {
+        if (properties == null) {
+
+            return SpasAdapter.getAk();
+        }
+
+        return TemplateUtils.stringEmptyAndThenExecute(properties.getProperty(PropertyKeyConst.ACCESS_KEY), new Callable<String>() {
+
+            @Override
+            public String call() {
+                return SpasAdapter.getAk();
+            }
+        });
+    }
+
+    public String getSecretKey() {
+        if (properties == null) {
+
+            return SpasAdapter.getSk();
+        }
+
+        return TemplateUtils.stringEmptyAndThenExecute(properties.getProperty(PropertyKeyConst.SECRET_KEY), new Callable<String>() {
+            @Override
+            public String call() throws Exception {
+                return SpasAdapter.getSk();
+            }
+        });
+    }
+
+    public void setProperties(Properties properties) {
+        this.properties = properties;
+        setServerPort(DEFAULT_SERVER_PORT);
+    }
+
+    public String getNamespaceId() {
+        return namespaceId;
+    }
+
+    public void setServerPort(int serverPort) {
+        this.serverPort = serverPort;
+
+        String sp = System.getProperty(SystemPropertyKeyConst.NAMING_SERVER_PORT);
+        if (StringUtils.isNotBlank(sp)) {
+            this.serverPort = Integer.parseInt(sp);
+        }
+    }
+
 }
+
